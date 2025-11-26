@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width,initial-scale=1" />
+		<title>Local transit system finder</title>
+		<style>
+			#postalSubmissionForm { display:flex; gap:0.5rem; align-items:center; margin-top:0.4rem; }
+			#submitPostal { padding:0.5rem; font-size:1rem; min-width:14ch; }
+			#submitButton { padding:0.45rem 0.8rem; }
+			.result { margin-top:0.8rem; padding:0.65rem; border-radius:6px; background:#f3f3f3; display:inline-block; }
+						.tiny-fineprint { font-size:0.65rem; color:#666; margin-top:1.25rem; text-align:center; }
+						.tiny-fineprint a { color:inherit; text-decoration:underline; }
+			.result.error { background:#ffeeee; color:#990000; }
+		</style>
+	</head>
+	<body>
+		<div>
+			<h1>Local Transit System Finder</h1>
+			<p class="hint">Enter a Canadian postal code (for example: <code>A1A1A1</code> or <code>A1A 1A1</code>).<br>We'll find and link you to the three closest local transit systems.</p>
+
+			<form id="postalSubmissionForm" onsubmit="return false;">
+				<label for="submitPostal" class="sr-only" style="display:none;">Canadian postal code</label>
+				<input id="submitPostal" name="postal" type="text" placeholder="e.g. A1A1A1" autocomplete="postal-code" aria-label="Postal code" />
+				<button id="submitButton" type="submit">Locate Nearby Local Transit</button>
+			</form>
+
+			<div id="output" class="result" hidden role="status" aria-live="polite">
+				<h3 id="closestHeading"></h3>
+				<ul id="closestList" style="margin-top:.6rem; padding-left:1.1rem;">
+					<!-- nearest results inserted here -->
+				</ul>
+			</div>
+		</div>
+
+		<script>
+			// Load transit systems from CSV file (assets/files/local_transit.csv). CSV columns: city,lat,lon,website
+			const TRANSIT_CSV_PATH = 'assets/files/local_transit.csv';
+			let TRANSIT_SYSTEMS = null; // cached array: {city, lat, lon, website}
+
+			function parseCSVLine(line) {
+				const fields = [];
+				let i = 0;
+				while (i < line.length) {
+					if (line[i] === '"') {
+						// quoted field
+						let j = i + 1;
+						let out = '';
+						while (j < line.length) {
+							if (line[j] === '"') {
+								if (line[j + 1] === '"') { // escaped quote
+									out += '"';
+									j += 2;
+									continue;
+								}
+								j++; // closing quote
+								break;
+							}
+							out += line[j];
+							j++;
+						}
+						// skip comma if present
+						if (line[j] === ',') j++;
+						fields.push(out);
+						i = j;
+					} else {
+						// unquoted field
+						const j = line.indexOf(',', i);
+						if (j === -1) {
+							fields.push(line.substring(i));
+							break;
+						}
+						fields.push(line.substring(i, j));
+						i = j + 1;
+					}
+				}
+				// trim whitespace from fields
+				return fields.map(f => f.trim());
+			}
+
+			async function loadTransitCSV() {
+				if (TRANSIT_SYSTEMS) return TRANSIT_SYSTEMS;
+				try {
+					const res = await fetch(TRANSIT_CSV_PATH);
+					if (!res.ok) return [];
+					const text = await res.text();
+					const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+					const arr = lines.map(line => {
+						const cols = parseCSVLine(line);
+						return {
+							city: cols[0] || '',
+							lat: Number(cols[1]) || 0,
+							lon: Number(cols[2]) || 0,
+							website: cols[3] || ''
+						};
+					});
+					TRANSIT_SYSTEMS = arr;
+					return arr;
+				} catch (e) {
+					return [];
+				}
+			}
+
+			// Helpers
+			function normalizePostal(s) {
+				if (!s || typeof s !== 'string') return '';
+				return s.toUpperCase().replace(/\s+/g, '');
+			}
+
+			function isValidCanadianPostal(postal) {
+				// Canadian postal code format: A1A1A1 or A1A 1A1
+				const normalized = normalizePostal(postal);
+				return /^[A-Z]\d[A-Z]\d[A-Z]\d$/.test(normalized);
+			}
+
+			// Haversine - compute distance in kilometres
+			function distanceKm(lat1, lon1, lat2, lon2) {
+				function toRad(v) { return v * Math.PI / 180; }
+				const R = 6371; // km
+				const dLat = toRad(lat2 - lat1);
+				const dLon = toRad(lon2 - lon1);
+				const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+					Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+					Math.sin(dLon / 2) * Math.sin(dLon / 2);
+				const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+				return R * c;
+			}
+
+			// Find the nearest N transit systems from a lat/lon pair
+			function findNearestTransits(lat, lon, n = 3) {
+				const list = TRANSIT_SYSTEMS || [];
+				// compute distances for all systems then sort
+				const withDist = list.map(t => ({ system: t, distanceKm: distanceKm(lat, lon, t.lat, t.lon) }));
+				withDist.sort((a, b) => a.distanceKm - b.distanceKm);
+				return withDist.slice(0, n);
+			}
+
+			// Try to geocode using geocoder.ca (ratelimited).
+			// Returns { lat, lon } or null.
+			async function geocodeWithGeocoderCA(postal) {
+				const apiUrl = `https://geocoder.ca/?postal=${encodeURIComponent(postal)}&json=1`;
+				try {
+					const controller = new AbortController();
+					const timeout = setTimeout(() => controller.abort(), 7000);
+					const res = await fetch(apiUrl, { signal: controller.signal });
+					clearTimeout(timeout);
+					if (!res.ok) return null;
+					const j = await res.json();
+					// geocoder.ca returns 'latt' and 'longt' on success
+					if (j && j.latt && j.longt) {
+						return { lat: Number(j.latt), lon: Number(j.longt) };
+					}
+					return null;
+				} catch (e) {
+					return null;
+				}
+			}
+
+			// Nominatim fallback (OpenStreetMap). This is used only when geocoder.ca
+			// fails. (heavily ratelimited)
+			async function geocodeWithNominatim(postal) {
+				// We query the postalcode for Canada explicitly and limit to one result
+				const apiUrl = `https://nominatim.openstreetmap.org/search?country=Canada&postalcode=${encodeURIComponent(postal)}&format=jsonv2&limit=1`;
+				try {
+					const controller = new AbortController();
+					const timeout = setTimeout(() => controller.abort(), 7000);
+					// Nominatim requires a sensible user agent; browsers will set one.
+					const res = await fetch(apiUrl, { signal: controller.signal });
+					clearTimeout(timeout);
+					if (!res.ok) return null;
+					const arr = await res.json();
+					if (Array.isArray(arr) && arr.length > 0 && arr[0].lat && arr[0].lon) {
+						return { lat: Number(arr[0].lat), lon: Number(arr[0].lon) };
+					}
+					return null;
+				} catch (e) {
+					return null;
+				}
+			}
+
+			// User interface
+			const form = document.getElementById('postalSubmissionForm');
+			const postalInput = document.getElementById('submitPostal');
+			const submitButton = document.getElementById('submitButton');
+			const output = document.getElementById('output');
+			const closestHeadingEl = document.getElementById('closestHeading');
+			const closestListEl = document.getElementById('closestList');
+
+			function setStatusMessage(msg, isError = false) {
+				output.hidden = false;
+				// show message in the heading and clear any existing list
+				closestHeadingEl.textContent = msg;
+				closestListEl.innerHTML = '';
+				output.classList.toggle('error', !!isError);
+			}
+
+			async function locatePostalAndShow(postal) {
+				const p = normalizePostal(postal);
+				if (!isValidCanadianPostal(p)) {
+					setStatusMessage('Please enter a valid Canadian postal code (A1A 1A1).', true);
+					return;
+				}
+
+				setStatusMessage('Looking up coordinates for ' + postal + '...');
+
+				// First try geocoder.ca
+				let coords = await geocodeWithGeocoderCA(p);
+				if (!coords) {
+					setStatusMessage('Primary geocoder failed — trying OpenStreetMap...');
+					coords = await geocodeWithNominatim(p);
+					if (!coords) {
+						setStatusMessage('Sorry — could not determine coordinates for that postal code. Try again later.', true);
+						return;
+					}
+				}
+
+				// Ensure transit data is loaded from CSV before finding nearest
+				if (!TRANSIT_SYSTEMS) await loadTransitCSV();
+				const nearestList = findNearestTransits(coords.lat, coords.lon, 3);
+				if (!Array.isArray(nearestList) || nearestList.length === 0) {
+					setStatusMessage('No nearby transit systems found.', true);
+					return;
+				}
+
+				// Build list UI
+				// Use the requested fixed heading
+				document.getElementById('closestHeading').textContent = 'Closest Three Transit Systems';
+
+				const listEl = document.getElementById('closestList');
+				listEl.innerHTML = '';
+				for (const item of nearestList) {
+					const li = document.createElement('li');
+
+					// Title line for the transit system
+					const title = document.createElement('h4');
+					title.textContent = `Transit System in ${item.system.city}`;
+					li.appendChild(title);
+
+					// Nested bullets for details: distance and website
+					const detailList = document.createElement('ul');
+
+					const aboutLi = document.createElement('li');
+					aboutLi.textContent = `About ${item.distanceKm.toFixed(1)} km away.`;
+					detailList.appendChild(aboutLi);
+
+					if (item.system.website) {
+						const linkLi = document.createElement('li');
+						const link = document.createElement('a');
+						link.href = item.system.website;
+						link.target = '_blank';
+						link.rel = 'noopener';
+						link.textContent = `Open system's website`;
+						linkLi.appendChild(link);
+						detailList.appendChild(linkLi);
+					}
+
+					li.appendChild(detailList);
+					listEl.appendChild(li);
+				}
+				output.hidden = false;
+			}
+
+			// Integration to form
+			form.addEventListener('submit', async (ev) => {
+				ev.preventDefault();
+				submitButton.disabled = true;
+				await locatePostalAndShow(postalInput.value || '');
+				submitButton.disabled = false;
+			});
+
+			// Support enter from the input field
+			postalInput.addEventListener('keydown', (ev) => {
+				if (ev.key === 'Enter') {
+					ev.preventDefault();
+					submitButton.click();
+				}
+			});
+		</script>
+		<footer class="tiny-fineprint" role="contentinfo">
+			Data heavily drawn from <a href="https://seanmarshall.ca/transport-map/" target="_blank" rel="noopener">Sean Marshall &amp; Transport Action Canada</a>'s <a href="https://walkitect.maps.arcgis.com/apps/instant/basic/index.html?appid=a74365535fb7443e84e6b40b354f8078" target="_blank" rel="noopener">Canada Intercity Transport Map</a>
+		</footer>
+	</body>
+</html>
